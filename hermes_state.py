@@ -31,7 +31,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -88,6 +88,14 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+
+CREATE TABLE IF NOT EXISTS message_embeddings (
+    message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    embedding TEXT NOT NULL,
+    model TEXT,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_message_embeddings_model ON message_embeddings(model);
 """
 
 FTS_SQL = """
@@ -329,6 +337,18 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 6")
+            if current_version < 7:
+                # v7: add message_embeddings table for semantic session search
+                cursor.executescript("""
+                    CREATE TABLE IF NOT EXISTS message_embeddings (
+                        message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+                        embedding TEXT NOT NULL,
+                        model TEXT,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_message_embeddings_model ON message_embeddings(model);
+                """)
+                cursor.execute("UPDATE schema_version SET version = 7")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -861,7 +881,30 @@ class SessionDB:
                 )
             return msg_id
 
-        return self._execute_write(_do)
+        msg_id = self._execute_write(_do)
+
+        # Lazy semantic embedding for user/assistant messages
+        if content and role in ("user", "assistant"):
+            def _embed_later():
+                try:
+                    from agent.session_embeddings import embed_text
+
+                    emb = embed_text(content)
+                    if emb:
+                        self._execute_write(
+                            lambda conn: conn.execute(
+                                """INSERT OR REPLACE INTO message_embeddings
+                                   (message_id, embedding, model, created_at)
+                                   VALUES (?, ?, ?, ?)""",
+                                (msg_id, json.dumps(emb), "session_embed", time.time()),
+                            )
+                        )
+                except Exception:
+                    pass
+
+            threading.Thread(target=_embed_later, daemon=True).start()
+
+        return msg_id
 
     def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages for a session, ordered by timestamp."""
@@ -1064,7 +1107,8 @@ class SessionDB:
                 m.tool_name,
                 s.source,
                 s.model,
-                s.started_at AS session_started
+                s.started_at AS session_started,
+                rank
             FROM messages_fts
             JOIN messages m ON m.id = messages_fts.rowid
             JOIN sessions s ON s.id = m.session_id
@@ -1144,6 +1188,102 @@ class SessionDB:
             match.pop("content", None)
 
         return matches
+
+    def search_messages_semantic(
+        self,
+        query_embedding: List[float],
+        candidate_message_ids: List[int] = None,
+        top_k: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """
+        Rank messages by cosine similarity to query_embedding.
+        If candidate_message_ids is None/empty, scans all embedded messages.
+        Returns list of dicts: message_id, session_id, similarity
+        """
+        if not query_embedding:
+            return []
+
+        if candidate_message_ids:
+            placeholders = ",".join("?" for _ in candidate_message_ids)
+            sql = f"""
+                SELECT m.id as message_id, m.session_id, me.embedding
+                FROM messages m
+                JOIN message_embeddings me ON m.id = me.message_id
+                WHERE m.id IN ({placeholders})
+            """
+            params = candidate_message_ids
+        else:
+            sql = """
+                SELECT m.id as message_id, m.session_id, me.embedding
+                FROM messages m
+                JOIN message_embeddings me ON m.id = me.message_id
+            """
+            params = []
+
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+
+        results = []
+        for row in rows:
+            try:
+                emb = json.loads(row["embedding"])
+                if len(emb) != len(query_embedding):
+                    continue
+                dot = sum(a * b for a, b in zip(query_embedding, emb))
+                results.append({
+                    "message_id": row["message_id"],
+                    "session_id": row["session_id"],
+                    "similarity": dot,
+                })
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        results.sort(key=lambda x: x["similarity"], reverse=True)
+        return results[:top_k]
+
+    def backfill_message_embeddings(self, limit: int = None) -> Dict[str, int]:
+        """Backfill embeddings for messages that don't have them yet."""
+        from agent.session_embeddings import embed_text
+
+        sql = """
+            SELECT m.id, m.content
+            FROM messages m
+            LEFT JOIN message_embeddings me ON m.id = me.message_id
+            WHERE me.message_id IS NULL
+              AND m.role IN ('user', 'assistant')
+              AND m.content IS NOT NULL
+              AND length(m.content) > 10
+            ORDER BY m.timestamp DESC
+        """
+        if limit:
+            sql += f" LIMIT {limit}"
+
+        with self._lock:
+            rows = self._conn.execute(sql).fetchall()
+
+        embedded = 0
+        skipped = 0
+        for row in rows:
+            msg_id = row["id"]
+            content = row["content"]
+            emb = embed_text(content)
+            if not emb:
+                skipped += 1
+                continue
+            try:
+                self._execute_write(
+                    lambda conn: conn.execute(
+                        """INSERT OR REPLACE INTO message_embeddings
+                           (message_id, embedding, model, created_at)
+                           VALUES (?, ?, ?, ?)""",
+                        (msg_id, json.dumps(emb), "session_embed", time.time()),
+                    )
+                )
+                embedded += 1
+            except Exception:
+                skipped += 1
+
+        return {"total": len(rows), "embedded": embedded, "skipped": skipped}
 
     def search_sessions(
         self,

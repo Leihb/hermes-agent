@@ -26,6 +26,22 @@ from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
 MAX_SESSION_CHARS = 100_000
 MAX_SUMMARY_TOKENS = 10000
 
+def _get_semantic_config() -> Dict[str, Any]:
+    """Read session_search semantic config from ~/.hermes/config.yaml"""
+    cfg = {}
+    try:
+        import yaml
+        from hermes_cli.config import get_hermes_home
+        config_path = get_hermes_home() / "config.yaml"
+        if config_path.exists():
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            cfg = data.get("session_search", {})
+    except Exception:
+        pass
+    return cfg
+
+
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
     """Convert a Unix timestamp (float/int) or ISO string to a human-readable date.
@@ -333,24 +349,6 @@ def session_search(
         if role_filter and role_filter.strip():
             role_list = [r.strip() for r in role_filter.split(",") if r.strip()]
 
-        # FTS5 search -- get matches ranked by relevance
-        raw_results = db.search_messages(
-            query=query,
-            role_filter=role_list,
-            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
-            limit=50,  # Get more matches to find unique sessions
-            offset=0,
-        )
-
-        if not raw_results:
-            return json.dumps({
-                "success": True,
-                "query": query,
-                "results": [],
-                "count": 0,
-                "message": "No matching sessions found.",
-            }, ensure_ascii=False)
-
         # Resolve child sessions to their parent — delegation stores detailed
         # content in child sessions, but the user's conversation is the parent.
         def _resolve_to_parent(session_id: str) -> str:
@@ -382,15 +380,21 @@ def session_search(
             _resolve_to_parent(current_session_id) if current_session_id else None
         )
 
-        # Group by resolved (parent) session_id, dedup, skip the current
-        # session lineage. Compression and delegation create child sessions
-        # that still belong to the same active conversation.
-        seen_sessions = {}
+        # ── Dual-recall: FTS5 + semantic embedding ──
+        # 1. FTS5 search
+        raw_results = db.search_messages(
+            query=query,
+            role_filter=role_list,
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            limit=50,
+            offset=0,
+        )
+
+        seen_sessions: Dict[str, Dict[str, Any]] = {}
+        # Seed from FTS5
         for result in raw_results:
             raw_sid = result["session_id"]
             resolved_sid = _resolve_to_parent(raw_sid)
-            # Skip the current session lineage — the agent already has that
-            # context, even if older turns live in parent fragments.
             if current_lineage_root and resolved_sid == current_lineage_root:
                 continue
             if current_session_id and raw_sid == current_session_id:
@@ -399,8 +403,103 @@ def session_search(
                 result = dict(result)
                 result["session_id"] = resolved_sid
                 seen_sessions[resolved_sid] = result
-            if len(seen_sessions) >= limit:
-                break
+
+        # 2. Semantic search — always runs as independent recall channel
+        semantic_cfg = _get_semantic_config()
+        semantic_weight = float(semantic_cfg.get("semantic_weight", 0.5))
+        semantic_results_map: Dict[str, float] = {}  # session_id -> max similarity
+
+        if semantic_cfg.get("semantic_enabled", False):
+            try:
+                from agent.session_embeddings import embed_text
+                query_emb = embed_text(query)
+                if query_emb:
+                    semantic_results = db.search_messages_semantic(
+                        query_embedding=query_emb,
+                        candidate_message_ids=None,
+                        top_k=limit * 10,
+                    )
+                    for r in semantic_results:
+                        sid = r["session_id"]
+                        resolved_sid = _resolve_to_parent(sid)
+                        if current_lineage_root and resolved_sid == current_lineage_root:
+                            continue
+                        if current_session_id and sid == current_session_id:
+                            continue
+                        sim = r.get("similarity", 0.0)
+                        semantic_results_map[resolved_sid] = max(
+                            semantic_results_map.get(resolved_sid, 0.0), sim
+                        )
+                        if resolved_sid not in seen_sessions:
+                            seen_sessions[resolved_sid] = {
+                                "session_id": resolved_sid,
+                                "source": r.get("source", "unknown"),
+                                "session_started": r.get("session_started", None),
+                            }
+            except Exception as e:
+                logging.warning("Semantic recall failed: %s", e)
+
+        if not seen_sessions:
+            return json.dumps({
+                "success": True,
+                "query": query,
+                "results": [],
+                "count": 0,
+                "sessions_searched": 0,
+                "message": "No matching sessions found.",
+            }, ensure_ascii=False)
+
+        # 3. Hybrid scoring & re-ranking
+        if semantic_cfg.get("semantic_enabled", False) and semantic_results_map:
+            session_scores: Dict[str, float] = {}
+
+            # Score FTS5 results
+            if raw_results:
+                candidate_ids = [r["id"] for r in raw_results if "id" in r]
+                if candidate_ids:
+                    # fetch similarities for FTS5 candidate messages
+                    try:
+                        cand_semantic = db.search_messages_semantic(
+                            query_embedding=query_emb,
+                            candidate_message_ids=candidate_ids,
+                            top_k=len(candidate_ids),
+                        )
+                        sim_map = {r["message_id"]: r["similarity"] for r in cand_semantic}
+                    except Exception:
+                        sim_map = {}
+
+                    ranks = [r.get("rank", 0) for r in raw_results if "id" in r]
+                    min_rank = min(ranks) if ranks else 0
+                    max_rank = max(ranks) if ranks else 0
+                    rank_range = max_rank - min_rank if max_rank != min_rank else 1.0
+
+                    for r in raw_results:
+                        msg_id = r.get("id")
+                        sid = r.get("session_id")
+                        if not msg_id or not sid:
+                            continue
+                        rank = r.get("rank", min_rank)
+                        fts_norm = (max_rank - rank) / rank_range
+                        sim = sim_map.get(msg_id, 0.0)
+                        combined = fts_norm * (1 - semantic_weight) + sim * semantic_weight
+                        session_scores[sid] = max(session_scores.get(sid, 0.0), combined)
+
+            # Merge pure-semantic sessions into scores
+            for sid, sim in semantic_results_map.items():
+                if sid in session_scores:
+                    # Boost sessions that appear in both channels
+                    session_scores[sid] = max(session_scores[sid], sim) * 1.05
+                else:
+                    session_scores[sid] = sim
+
+            seen_sessions = dict(sorted(
+                seen_sessions.items(),
+                key=lambda item: session_scores.get(item[0], 0.0),
+                reverse=True,
+            )[:limit])
+        else:
+            # FTS5 only — truncate to limit
+            seen_sessions = dict(list(seen_sessions.items())[:limit])
 
         # Prepare all sessions for parallel summarization
         tasks = []
