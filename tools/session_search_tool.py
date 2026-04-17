@@ -41,6 +41,45 @@ def _get_semantic_config() -> Dict[str, Any]:
         pass
     return cfg
 
+def _compute_semantic_weight(query: str, cfg: Dict[str, Any]) -> float:
+    """
+    Heuristic dynamic weight for hybrid scoring.
+    Higher weight = trust semantic embedding more; lower = trust FTS5 keywords more.
+    """
+    q = query.lower().strip()
+    if not q:
+        return float(cfg.get("semantic_weight", 0.5))
+
+    # Patterns that indicate precise keyword/entity matches are more important
+    keyword_heavy_patterns = [
+        r"\b(error|err)\s*\d+",            # error codes
+        r"\d+\.\d+\.\d+",                   # version numbers
+        r"/[a-zA-Z0-9_\-./]+",              # file paths
+        r"\b0x[0-9a-fA-F]+\b",             # hex values
+        r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}",  # UUID-ish
+        r"`[^`]+`",                         # inline code
+        r"\b[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*\b",  # module.func patterns
+    ]
+    keyword_score = sum(1 for p in keyword_heavy_patterns if re.search(p, query))
+    if keyword_score >= 2:
+        return 0.25
+    if keyword_score == 1:
+        return 0.35
+
+    # Semantic/conceptual question patterns
+    semantic_boost_keywords = [
+        "怎么", "如何", "为什么", "是什么", "什么意思",
+        "原理", "机制", "方案", "思路", "建议", "优缺点",
+        "区别", "差异", "对比", "哪个好", "有没有",
+        "how to", "what is", "why", "difference between",
+        "compare", "pros and cons", "approach", "idea",
+    ]
+    if any(kw in q for kw in semantic_boost_keywords):
+        return 0.7
+
+    # Default: balanced hybrid
+    return float(cfg.get("semantic_weight", 0.5))
+
 
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
@@ -406,7 +445,7 @@ def session_search(
 
         # 2. Semantic search — always runs as independent recall channel
         semantic_cfg = _get_semantic_config()
-        semantic_weight = float(semantic_cfg.get("semantic_weight", 0.5))
+        semantic_weight = _compute_semantic_weight(query, semantic_cfg)
         semantic_results_map: Dict[str, float] = {}  # session_id -> max similarity
 
         if semantic_cfg.get("semantic_enabled", False):

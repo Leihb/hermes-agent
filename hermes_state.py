@@ -19,6 +19,7 @@ import logging
 import random
 import re
 import sqlite3
+import struct
 import threading
 import time
 from pathlib import Path
@@ -31,7 +32,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -164,6 +165,15 @@ class SessionDB:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+
+        # Load sqlite-vec extension for ANN vector search
+        try:
+            self._conn.enable_load_extension(True)
+            import sqlite_vec
+            sqlite_vec.load(self._conn)
+            self._conn.enable_load_extension(False)
+        except Exception as e:
+            logger.warning("Failed to load sqlite-vec extension: %s", e)
 
         self._init_schema()
 
@@ -349,6 +359,15 @@ class SessionDB:
                     CREATE INDEX IF NOT EXISTS idx_message_embeddings_model ON message_embeddings(model);
                 """)
                 cursor.execute("UPDATE schema_version SET version = 7")
+            if current_version < 8:
+                # v8: add sqlite-vec virtual table for fast ANN semantic search
+                cursor.executescript("""
+                    CREATE TABLE IF NOT EXISTS vec_metadata (
+                        key TEXT PRIMARY KEY,
+                        value TEXT
+                    );
+                """)
+                cursor.execute("UPDATE schema_version SET version = 8")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -891,20 +910,36 @@ class SessionDB:
 
                     emb = embed_text(content)
                     if emb:
-                        self._execute_write(
-                            lambda conn: conn.execute(
-                                """INSERT OR REPLACE INTO message_embeddings
-                                   (message_id, embedding, model, created_at)
-                                   VALUES (?, ?, ?, ?)""",
-                                (msg_id, json.dumps(emb), "session_embed", time.time()),
-                            )
-                        )
+                        self._insert_embedding(msg_id, emb, "session_embed")
                 except Exception:
                     pass
 
             threading.Thread(target=_embed_later, daemon=True).start()
 
         return msg_id
+
+    def _insert_embedding(self, msg_id: int, emb: List[float], model: str = "session_embed") -> None:
+        """Store embedding in both the metadata table and the sqlite-vec ANN table."""
+        dim = len(emb)
+        if not self._ensure_vec_table(dim):
+            return
+        blob = struct.pack("f" * dim, *emb)
+        self._execute_write(
+            lambda conn: conn.execute(
+                """INSERT OR REPLACE INTO message_embeddings
+                   (message_id, embedding, model, created_at)
+                   VALUES (?, ?, ?, ?)""",
+                (msg_id, json.dumps(emb), model, time.time()),
+            )
+        )
+        self._execute_write(
+            lambda conn: conn.execute(
+                """INSERT OR REPLACE INTO message_embeddings_vec
+                   (rowid, embedding)
+                   VALUES (?, ?)""",
+                (msg_id, blob),
+            )
+        )
 
     def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages for a session, ordered by timestamp."""
@@ -1189,6 +1224,43 @@ class SessionDB:
 
         return matches
 
+    def _ensure_vec_table(self, dim: int) -> bool:
+        """
+        Ensure the sqlite-vec virtual table exists with the correct dimension.
+        If the dimension has changed, drops and recreates the table.
+        Returns True if vec table is ready, False otherwise.
+        """
+        try:
+            with self._lock:
+                cursor = self._conn.cursor()
+                cursor.execute("SELECT value FROM vec_metadata WHERE key = 'dim'")
+                row = cursor.fetchone()
+                stored_dim = int(row[0]) if row else None
+
+                # Check if table exists
+                table_exists = False
+                try:
+                    cursor.execute("SELECT 1 FROM message_embeddings_vec LIMIT 0")
+                    table_exists = True
+                except sqlite3.OperationalError:
+                    pass
+
+                if stored_dim != dim or not table_exists:
+                    if table_exists:
+                        cursor.execute("DROP TABLE message_embeddings_vec")
+                    cursor.execute(
+                        f"CREATE VIRTUAL TABLE message_embeddings_vec USING vec0(embedding float[{dim}])"
+                    )
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO vec_metadata (key, value) VALUES ('dim', ?)",
+                        (str(dim),),
+                    )
+                    self._conn.commit()
+            return True
+        except Exception as e:
+            logger.warning("Failed to ensure vec0 table: %s", e)
+            return False
+
     def search_messages_semantic(
         self,
         query_embedding: List[float],
@@ -1196,50 +1268,66 @@ class SessionDB:
         top_k: int = 50,
     ) -> List[Dict[str, Any]]:
         """
-        Rank messages by cosine similarity to query_embedding.
+        Rank messages by cosine similarity to query_embedding using sqlite-vec ANN.
         If candidate_message_ids is None/empty, scans all embedded messages.
         Returns list of dicts: message_id, session_id, similarity
         """
         if not query_embedding:
             return []
 
+        dim = len(query_embedding)
+        if not self._ensure_vec_table(dim):
+            return []
+
+        query_blob = struct.pack("f" * dim, *query_embedding)
+
         if candidate_message_ids:
             placeholders = ",".join("?" for _ in candidate_message_ids)
             sql = f"""
-                SELECT m.id as message_id, m.session_id, me.embedding
-                FROM messages m
-                JOIN message_embeddings me ON m.id = me.message_id
-                WHERE m.id IN ({placeholders})
+                WITH vec_matches AS (
+                    SELECT rowid as message_id, distance
+                    FROM message_embeddings_vec
+                    WHERE embedding MATCH ?
+                      AND rowid IN ({placeholders})
+                    LIMIT ?
+                )
+                SELECT v.message_id, m.session_id, v.distance
+                FROM vec_matches v
+                JOIN messages m ON v.message_id = m.id
+                ORDER BY v.distance
             """
-            params = candidate_message_ids
+            params = [query_blob] + list(candidate_message_ids) + [top_k]
         else:
             sql = """
-                SELECT m.id as message_id, m.session_id, me.embedding
-                FROM messages m
-                JOIN message_embeddings me ON m.id = me.message_id
+                WITH vec_matches AS (
+                    SELECT rowid as message_id, distance
+                    FROM message_embeddings_vec
+                    WHERE embedding MATCH ?
+                    LIMIT ?
+                )
+                SELECT v.message_id, m.session_id, v.distance
+                FROM vec_matches v
+                JOIN messages m ON v.message_id = m.id
+                ORDER BY v.distance
             """
-            params = []
+            params = [query_blob, top_k]
 
         with self._lock:
             rows = self._conn.execute(sql, params).fetchall()
 
         results = []
         for row in rows:
-            try:
-                emb = json.loads(row["embedding"])
-                if len(emb) != len(query_embedding):
-                    continue
-                dot = sum(a * b for a, b in zip(query_embedding, emb))
-                results.append({
-                    "message_id": row["message_id"],
-                    "session_id": row["session_id"],
-                    "similarity": dot,
-                })
-            except (json.JSONDecodeError, TypeError):
-                continue
+            # Vectors are normalized, so L2 distance -> cosine similarity:
+            # cosine_sim = 1 - (distance^2) / 2
+            distance = row["distance"]
+            similarity = max(0.0, 1.0 - (distance * distance) / 2.0)
+            results.append({
+                "message_id": row["message_id"],
+                "session_id": row["session_id"],
+                "similarity": similarity,
+            })
 
-        results.sort(key=lambda x: x["similarity"], reverse=True)
-        return results[:top_k]
+        return results
 
     def backfill_message_embeddings(self, limit: int = None) -> Dict[str, int]:
         """Backfill embeddings for messages that don't have them yet."""
@@ -1248,8 +1336,8 @@ class SessionDB:
         sql = """
             SELECT m.id, m.content
             FROM messages m
-            LEFT JOIN message_embeddings me ON m.id = me.message_id
-            WHERE me.message_id IS NULL
+            LEFT JOIN message_embeddings_vec me ON m.id = me.rowid
+            WHERE me.rowid IS NULL
               AND m.role IN ('user', 'assistant')
               AND m.content IS NOT NULL
               AND length(m.content) > 10
@@ -1259,7 +1347,11 @@ class SessionDB:
             sql += f" LIMIT {limit}"
 
         with self._lock:
-            rows = self._conn.execute(sql).fetchall()
+            try:
+                rows = self._conn.execute(sql).fetchall()
+            except sqlite3.OperationalError:
+                # vec table may not exist yet (e.g. extension not loaded or fresh db)
+                rows = []
 
         embedded = 0
         skipped = 0
@@ -1271,14 +1363,7 @@ class SessionDB:
                 skipped += 1
                 continue
             try:
-                self._execute_write(
-                    lambda conn: conn.execute(
-                        """INSERT OR REPLACE INTO message_embeddings
-                           (message_id, embedding, model, created_at)
-                           VALUES (?, ?, ?, ?)""",
-                        (msg_id, json.dumps(emb), "session_embed", time.time()),
-                    )
-                )
+                self._insert_embedding(msg_id, emb, "session_embed")
                 embedded += 1
             except Exception:
                 skipped += 1
