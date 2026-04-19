@@ -12,9 +12,12 @@ Configure in ~/.hermes/config.yaml under `session_search:`.
 
 import json
 import hashlib
+import logging
 import math
 import os
 from typing import List, Optional, Dict
+
+logger = logging.getLogger(__name__)
 
 # Lazy-loaded singletons
 _fastembed_model = None
@@ -61,6 +64,7 @@ def embed_text(text: str) -> List[float]:
 
     if emb:
         return emb
+    logger.warning("All embedding providers failed for '%s...' — falling back to mock (no semantic meaning)", text[:40])
     return _embed_mock(text)
 
 

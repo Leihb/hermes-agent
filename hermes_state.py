@@ -14,6 +14,7 @@ Key design decisions:
 - Session source tagging ('cli', 'telegram', 'discord', etc.) for filtering
 """
 
+import atexit
 import json
 import logging
 import random
@@ -22,6 +23,7 @@ import sqlite3
 import struct
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Any, Callable, Dict, List, Optional, TypeVar
@@ -121,6 +123,20 @@ END;
 """
 
 
+_EMBED_EXECUTOR = None
+_EMBED_EXECUTOR_LOCK = threading.Lock()
+
+
+def _shutdown_embed_executor():
+    '''Cleanup hook for the embedding thread pool.'''
+    if _EMBED_EXECUTOR is not None:
+        _EMBED_EXECUTOR.shutdown(wait=False)
+        globals()['_EMBED_EXECUTOR'] = None
+
+
+atexit.register(_shutdown_embed_executor)
+
+
 class SessionDB:
     """
     SQLite-backed session storage with FTS5 search.
@@ -176,6 +192,36 @@ class SessionDB:
             logger.warning("Failed to load sqlite-vec extension: %s", e)
 
         self._init_schema()
+
+    # ── Embedding executor (class-level singleton) ──
+
+    @classmethod
+    def _get_embed_executor(cls) -> ThreadPoolExecutor:
+        global _EMBED_EXECUTOR, _EMBED_EXECUTOR_LOCK
+        if _EMBED_EXECUTOR is None:
+            with _EMBED_EXECUTOR_LOCK:
+                if _EMBED_EXECUTOR is None:
+                    _EMBED_EXECUTOR = ThreadPoolExecutor(
+                        max_workers=2, thread_name_prefix="embed-"
+                    )
+        return _EMBED_EXECUTOR
+
+    def _submit_embedding(self, msg_id: int, content: str) -> None:
+        '''Submit an embedding job to the thread pool.'''
+        if not content or not content.strip():
+            return
+        executor = self._get_embed_executor()
+        executor.submit(self._do_embed, msg_id, content)
+
+    def _do_embed(self, msg_id: int, content: str) -> None:
+        '''Generate and store embedding for a single message.'''
+        try:
+            from agent.session_embeddings import embed_text
+            emb = embed_text(content)
+            if emb:
+                self._insert_embedding(msg_id, emb, "session_embed")
+        except Exception as e:
+            logger.warning("Embedding failed for msg %s: %s", msg_id, e)
 
     # ── Core write helper ──
 
@@ -904,42 +950,43 @@ class SessionDB:
 
         # Lazy semantic embedding for user/assistant messages
         if content and role in ("user", "assistant"):
-            def _embed_later():
-                try:
-                    from agent.session_embeddings import embed_text
-
-                    emb = embed_text(content)
-                    if emb:
-                        self._insert_embedding(msg_id, emb, "session_embed")
-                except Exception:
-                    pass
-
-            threading.Thread(target=_embed_later, daemon=True).start()
+            self._submit_embedding(msg_id, content)
 
         return msg_id
 
     def _insert_embedding(self, msg_id: int, emb: List[float], model: str = "session_embed") -> None:
         """Store embedding in both the metadata table and the sqlite-vec ANN table."""
         dim = len(emb)
-        if not self._ensure_vec_table(dim):
+        # 1. Always persist to the JSON metadata table first (source of truth)
+        try:
+            self._execute_write(
+                lambda conn: conn.execute(
+                    """INSERT OR REPLACE INTO message_embeddings
+                       (message_id, embedding, model, created_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (msg_id, json.dumps(emb), model, time.time()),
+                )
+            )
+        except Exception as e:
+            logger.warning("Failed to persist embedding JSON for msg %s: %s", msg_id, e)
             return
-        blob = struct.pack("f" * dim, *emb)
-        self._execute_write(
-            lambda conn: conn.execute(
-                """INSERT OR REPLACE INTO message_embeddings
-                   (message_id, embedding, model, created_at)
-                   VALUES (?, ?, ?, ?)""",
-                (msg_id, json.dumps(emb), model, time.time()),
+
+        # 2. Best-effort index into sqlite-vec ANN table
+        if not self._ensure_vec_table(dim):
+            logger.warning("sqlite-vec unavailable for msg %s — embedding stored in JSON only", msg_id)
+            return
+        try:
+            blob = struct.pack("f" * dim, *emb)
+            self._execute_write(
+                lambda conn: conn.execute(
+                    """INSERT OR REPLACE INTO message_embeddings_vec
+                       (rowid, embedding)
+                       VALUES (?, ?)""",
+                    (msg_id, blob),
+                )
             )
-        )
-        self._execute_write(
-            lambda conn: conn.execute(
-                """INSERT OR REPLACE INTO message_embeddings_vec
-                   (rowid, embedding)
-                   VALUES (?, ?)""",
-                (msg_id, blob),
-            )
-        )
+        except Exception as e:
+            logger.warning("Failed to write vec index for msg %s: %s", msg_id, e)
 
     def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages for a session, ordered by timestamp."""
@@ -1227,7 +1274,8 @@ class SessionDB:
     def _ensure_vec_table(self, dim: int) -> bool:
         """
         Ensure the sqlite-vec virtual table exists with the correct dimension.
-        If the dimension has changed, drops and recreates the table.
+        If the dimension has changed, preserves old data in JSON table and
+        recreates the vec index (with automatic backfill from JSON).
         Returns True if vec table is ready, False otherwise.
         """
         try:
@@ -1245,21 +1293,67 @@ class SessionDB:
                 except sqlite3.OperationalError:
                     pass
 
-                if stored_dim != dim or not table_exists:
-                    if table_exists:
-                        cursor.execute("DROP TABLE message_embeddings_vec")
-                    cursor.execute(
-                        f"CREATE VIRTUAL TABLE message_embeddings_vec USING vec0(embedding float[{dim}])"
-                    )
-                    cursor.execute(
-                        "INSERT OR REPLACE INTO vec_metadata (key, value) VALUES ('dim', ?)",
-                        (str(dim),),
-                    )
-                    self._conn.commit()
+                if stored_dim == dim and table_exists:
+                    return True
+
+                if table_exists:
+                    # NEVER drop — old vec data is useless with wrong dim,
+                    # but JSON table is the source of truth and stays safe.
+                    logger.info("Vec table dim mismatch %s -> %s. Recreating index...", stored_dim, dim)
+                    cursor.execute("DROP TABLE message_embeddings_vec")
+
+                cursor.execute(
+                    f"CREATE VIRTUAL TABLE message_embeddings_vec USING vec0(embedding float[{dim}])"
+                )
+                cursor.execute(
+                    "INSERT OR REPLACE INTO vec_metadata (key, value) VALUES ('dim', ?)",
+                    (str(dim),),
+                )
+                self._conn.commit()
+
+                # Backfill from JSON table so the new vec index is immediately useful
+                self._backfill_vec_from_json(dim)
             return True
         except Exception as e:
             logger.warning("Failed to ensure vec0 table: %s", e)
             return False
+
+    def _backfill_vec_from_json(self, dim: int, batch_size: int = 100) -> Dict[str, int]:
+        """Repopulate the sqlite-vec table from the JSON message_embeddings table."""
+        inserted = 0
+        skipped = 0
+        try:
+            with self._lock:
+                cursor = self._conn.cursor()
+                cursor.execute(
+                    """SELECT message_id, embedding FROM message_embeddings
+                       WHERE length(embedding) > 10"""
+                )
+                rows = cursor.fetchall()
+
+            for row in rows:
+                try:
+                    emb = json.loads(row["embedding"])
+                    if len(emb) != dim:
+                        skipped += 1
+                        continue
+                    blob = struct.pack("f" * dim, *emb)
+                    with self._lock:
+                        self._conn.execute(
+                            """INSERT OR REPLACE INTO message_embeddings_vec
+                               (rowid, embedding) VALUES (?, ?)""",
+                            (row["message_id"], blob),
+                        )
+                    inserted += 1
+                    if inserted % batch_size == 0:
+                        self._conn.commit()
+                except Exception:
+                    skipped += 1
+            self._conn.commit()
+            logger.info("Vec backfill complete: %s inserted, %s skipped (dim=%s)", inserted, skipped, dim)
+        except Exception as e:
+            logger.warning("Vec backfill failed: %s", e)
+        return {"inserted": inserted, "skipped": skipped}
 
     def search_messages_semantic(
         self,
