@@ -208,7 +208,7 @@ class SessionDB:
 
     def _submit_embedding(self, msg_id: int, content: str) -> None:
         '''Submit an embedding job to the thread pool.'''
-        if not content or not content.strip():
+        if not content or not content.strip() or len(content.strip()) <= 10:
             return
         executor = self._get_embed_executor()
         executor.submit(self._do_embed, msg_id, content)
