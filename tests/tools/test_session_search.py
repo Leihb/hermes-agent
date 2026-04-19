@@ -6,10 +6,7 @@ import pytest
 
 from tools.session_search_tool import (
     _format_timestamp,
-    _format_conversation,
-    _truncate_around_matches,
     _HIDDEN_SESSION_SOURCES,
-    MAX_SESSION_CHARS,
     SESSION_SEARCH_SCHEMA,
 )
 
@@ -62,123 +59,6 @@ class TestFormatTimestamp:
         result = _format_timestamp("1700000000.0")
         assert isinstance(result, str)
         assert "unknown" not in result.lower()
-
-
-# =========================================================================
-# _format_conversation
-# =========================================================================
-
-class TestFormatConversation:
-    def test_basic_messages(self):
-        msgs = [
-            {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "Hi there!"},
-        ]
-        result = _format_conversation(msgs)
-        assert "[USER]: Hello" in result
-        assert "[ASSISTANT]: Hi there!" in result
-
-    def test_tool_message(self):
-        msgs = [
-            {"role": "tool", "content": "search results", "tool_name": "web_search"},
-        ]
-        result = _format_conversation(msgs)
-        assert "[TOOL:web_search]" in result
-
-    def test_long_tool_output_truncated(self):
-        msgs = [
-            {"role": "tool", "content": "x" * 1000, "tool_name": "terminal"},
-        ]
-        result = _format_conversation(msgs)
-        assert "[truncated]" in result
-
-    def test_assistant_with_tool_calls(self):
-        msgs = [
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {"function": {"name": "web_search"}},
-                    {"function": {"name": "terminal"}},
-                ],
-            },
-        ]
-        result = _format_conversation(msgs)
-        assert "web_search" in result
-        assert "terminal" in result
-
-    def test_empty_messages(self):
-        result = _format_conversation([])
-        assert result == ""
-
-
-# =========================================================================
-# _truncate_around_matches
-# =========================================================================
-
-class TestTruncateAroundMatches:
-    def test_short_text_unchanged(self):
-        text = "Short text about docker"
-        result = _truncate_around_matches(text, "docker")
-        assert result == text
-
-    def test_long_text_truncated(self):
-        # Create text longer than MAX_SESSION_CHARS with query term in middle
-        padding = "x" * (MAX_SESSION_CHARS + 5000)
-        text = padding + " KEYWORD_HERE " + padding
-        result = _truncate_around_matches(text, "KEYWORD_HERE")
-        assert len(result) <= MAX_SESSION_CHARS + 100  # +100 for prefix/suffix markers
-        assert "KEYWORD_HERE" in result
-
-    def test_truncation_adds_markers(self):
-        text = "a" * 50000 + " target " + "b" * (MAX_SESSION_CHARS + 5000)
-        result = _truncate_around_matches(text, "target")
-        assert "truncated" in result.lower()
-
-    def test_no_match_takes_from_start(self):
-        text = "x" * (MAX_SESSION_CHARS + 5000)
-        result = _truncate_around_matches(text, "nonexistent")
-        # Should take from the beginning
-        assert result.startswith("x")
-
-    def test_match_at_beginning(self):
-        text = "KEYWORD " + "x" * (MAX_SESSION_CHARS + 5000)
-        result = _truncate_around_matches(text, "KEYWORD")
-        assert "KEYWORD" in result
-
-    def test_multiword_phrase_match_beats_individual_term(self):
-        """Full phrase deep in text should be found even when a single term
-        appears much earlier in boilerplate."""
-        boilerplate = "The project setup is complex. " * 500  # ~15K, has 'project' early
-        filler = "x" * (MAX_SESSION_CHARS + 20000)
-        target = "We reviewed the keystone project roadmap in detail."
-        text = boilerplate + filler + target + filler
-        result = _truncate_around_matches(text, "keystone project")
-        assert "keystone project" in result.lower()
-
-    def test_multiword_proximity_cooccurrence(self):
-        """When exact phrase is absent, terms co-occurring within proximity
-        should be preferred over a lone early term."""
-        early = "project " + "a" * (MAX_SESSION_CHARS + 20000)
-        # Place 'keystone' and 'project' near each other (but not as exact phrase)
-        cooccur = "this keystone initiative for the project was pivotal"
-        tail = "b" * (MAX_SESSION_CHARS + 20000)
-        text = early + cooccur + tail
-        result = _truncate_around_matches(text, "keystone project")
-        assert "keystone" in result.lower()
-        assert "project" in result.lower()
-
-    def test_multiword_window_maximises_coverage(self):
-        """Sliding window should capture as many match clusters as possible."""
-        # Place two phrase matches: one at ~50K, one at ~60K, both should fit
-        pre = "z" * 50000
-        match1 = " alpha beta "
-        gap = "z" * 10000
-        match2 = " alpha beta "
-        post = "z" * (MAX_SESSION_CHARS + 40000)
-        text = pre + match1 + gap + match2 + post
-        result = _truncate_around_matches(text, "alpha beta")
-        assert result.lower().count("alpha beta") == 2
 
 
 # =========================================================================
@@ -247,14 +127,9 @@ class TestSessionSearch:
             {"role": "assistant", "content": "hi there"},
         ]
 
-        # Mock async_call_llm to raise RuntimeError → summarizer returns None
-        from unittest.mock import AsyncMock, patch as _patch
-        with _patch("tools.session_search_tool.async_call_llm",
-                     new_callable=AsyncMock,
-                     side_effect=RuntimeError("no provider")):
-            result = json.loads(session_search(
-                query="test", db=mock_db, current_session_id=current_sid,
-            ))
+        result = json.loads(session_search(
+            query="test", db=mock_db, current_session_id=current_sid,
+        ))
 
         assert result["success"] is True
         # Current session should be skipped, only other_sid should appear
