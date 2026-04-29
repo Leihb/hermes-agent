@@ -24,8 +24,8 @@ from __future__ import annotations
 import pytest
 
 
-class TestKimiCodingSkipsAnthropicThinking:
-    """build_anthropic_kwargs must not inject ``thinking`` for Kimi /coding."""
+class TestKimiCodingAnthropicThinking:
+    """build_anthropic_kwargs must inject ``thinking`` for Kimi /coding when reasoning is enabled."""
 
     @pytest.mark.parametrize(
         "base_url",
@@ -36,7 +36,7 @@ class TestKimiCodingSkipsAnthropicThinking:
             "https://api.kimi.com/coding/",
         ],
     )
-    def test_kimi_coding_endpoint_omits_thinking(self, base_url: str) -> None:
+    def test_kimi_coding_endpoint_gets_thinking(self, base_url: str) -> None:
         from agent.anthropic_adapter import build_anthropic_kwargs
 
         kwargs = build_anthropic_kwargs(
@@ -47,13 +47,12 @@ class TestKimiCodingSkipsAnthropicThinking:
             reasoning_config={"enabled": True, "effort": "medium"},
             base_url=base_url,
         )
-        assert "thinking" not in kwargs, (
-            "Anthropic thinking must not be sent to Kimi /coding — "
-            "endpoint requires reasoning_content on history we don't preserve."
+        assert "thinking" in kwargs, (
+            "Anthropic thinking must be sent to Kimi /coding so the Reasoning box displays."
         )
-        assert "output_config" not in kwargs
+        assert kwargs["thinking"]["type"] == "enabled"
 
-    def test_kimi_coding_with_explicit_disabled_also_omits(self) -> None:
+    def test_kimi_coding_with_explicit_disabled_omits_thinking(self) -> None:
         from agent.anthropic_adapter import build_anthropic_kwargs
 
         kwargs = build_anthropic_kwargs(
