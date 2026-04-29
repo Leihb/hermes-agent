@@ -1681,7 +1681,8 @@ def convert_messages_to_anthropic(
             m["content"] = new_content or [{"type": "text", "text": "(empty)"}]
         elif _is_third_party or idx != last_assistant_idx:
             # Third-party endpoint: strip ALL thinking blocks from every
-            # assistant message — signatures are Anthropic-proprietary.
+            # assistant message — signatures are Anthropic-proprietary and
+            # some providers reject unrecognised content block types.
             # Direct Anthropic: strip from non-latest assistant messages only.
             stripped = [
                 b for b in m["content"]
